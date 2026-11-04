@@ -72,3 +72,7 @@ that is still mid-print.
 Verified on hardware: read-only status of the A1 mini, FTPS/MQTT payload shapes are the ones proven
 manually. NOT verified on hardware through this server: real print start/upload, pause, resume, stop,
 light (`work_light` vs `chamber_light` node names), speed, gcode.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
