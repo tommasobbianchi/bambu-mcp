@@ -28,6 +28,15 @@ def pushall_payload() -> dict:
     return {"pushing": {"sequence_id": "1", "command": "pushall"}}
 
 
+def tray_index(ams_id: int, slot_id: int) -> int:
+    """Global tray index used in ams_mapping: ams_id*4+slot; AMS HT units (id >= 128) use their id."""
+    return ams_id if ams_id >= 128 else ams_id * 4 + slot_id
+
+
+def tray_ams_slot(tray: int) -> tuple[int, int]:
+    return (tray, 0) if tray >= 128 else (tray // 4, tray % 4)
+
+
 def project_file_payload(*, subtask_name: str, remote_file: str, md5: str, plate: int = 1,
                          trays: list[int], use_ams: bool = True, timelapse: bool = False,
                          bed_leveling: bool = True, flow_cali: bool = False,
@@ -41,7 +50,7 @@ def project_file_payload(*, subtask_name: str, remote_file: str, md5: str, plate
         "flow_cali": flow_cali, "vibration_cali": vibration_cali, "layer_inspect": layer_inspect,
         "use_ams": use_ams,
         "ams_mapping": list(trays),
-        "ams_mapping2": [{"ams_id": t // 4, "slot_id": t % 4} for t in trays],
+        "ams_mapping2": [{"ams_id": tray_ams_slot(t)[0], "slot_id": tray_ams_slot(t)[1]} for t in trays],
         "profile_id": "0", "project_id": "0", "subtask_id": "0", "task_id": "0"}}
 
 
@@ -92,7 +101,7 @@ def trays_of(state: dict) -> list[dict]:
         uid = int(unit.get("id", 0))
         for t in unit.get("tray", []) or []:
             sid = int(t.get("id", 0))
-            out.append({"tray": uid * 4 + sid, "ams": uid, "slot": sid + 1,
+            out.append({"tray": tray_index(uid, sid), "ams": uid, "slot": sid + 1,
                         "type": t.get("tray_type") or None, "color": t.get("tray_color") or None,
                         "brand": t.get("tray_sub_brands") or None})
     return out
@@ -128,9 +137,12 @@ def preflight(state: dict, trays: list[int], expect_filament: Optional[str],
               expect_color: Optional[str]) -> list[str]:
     """Return a list of human-readable problems (empty = OK to start)."""
     problems = []
-    gs = state.get("print", {}).get("gcode_state")
-    if gs not in ("IDLE", "FINISH"):
-        problems.append(f"printer state is {gs!r}; must be IDLE or FINISH")
+    pr = state.get("print", {})
+    gs = pr.get("gcode_state")
+    failed_clear = gs == "FAILED" and not pr.get("print_error") and not pr.get("hms")
+    if gs not in ("IDLE", "FINISH") and not failed_clear:
+        problems.append(f"printer state is {gs!r}; must be IDLE or FINISH "
+                        f"(FAILED is accepted only with print_error=0 and no HMS)")
     have = {t["tray"]: t for t in trays_of(state)}
     for t in trays:
         tr = have.get(t)
