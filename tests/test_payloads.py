@@ -95,3 +95,70 @@ def test_scrub():
     from bambu_mcp.config import _SECRETS, scrub
     _SECRETS.add(CODE)
     assert CODE not in scrub(f"error with {CODE}")
+
+
+# --- OrcaSlicer-style payload (P1S firmware 01.10 rejects the legacy form with HMS 0500-4003) ----------
+def test_orca_style_payload_matches_recorded_orcaslicer_message():
+    p = M.project_file_payload(subtask_name="x", remote_file="Filament Junction Lever 3_4-B.gcode.3mf",
+                               md5="85121F6B33AA197F62472DFD86C5AC4A", trays=[4], style="orca")["print"]
+    assert p["url"] == "ftp://Filament Junction Lever 3_4-B.gcode.3mf"
+    assert p["file"] == "Filament Junction Lever 3_4-B.gcode.3mf"
+    assert p["subtask_name"] == "Filament Junction Lever 3_4-B"
+    assert p["ams_mapping"] == [4] and p["ams_mapping2"] == [{"ams_id": 1, "slot_id": 0}]
+    assert (p["auto_bed_leveling"], p["cfg"], p["extrude_cali_flag"], p["nozzle_offset_cali"]) == (1, "0", 2, 2)
+    assert p["bed_type"] == "textured_plate" and p["layer_inspect"] is True and p["flow_cali"] is False
+    assert M.project_file_payload(subtask_name="x", remote_file="a.3mf", md5="m", trays=[0], flow_cali=True,
+                                  style="orca", bed_type="supertack_plate")["print"]["extrude_cali_flag"] == 1
+
+
+def test_payload_style_for_serial():
+    assert M.payload_style_for("01P00C4C1300919") == "orca"      # P1S
+    assert M.payload_style_for("0309DA000000000") == "legacy"    # A1 mini
+    assert M.payload_style_for("039000000000000") == "legacy"    # A1
+
+
+def test_ams_ht_tray_index_and_mapping():
+    assert M.tray_index(1, 0) == 4 and M.tray_index(0, 3) == 3 and M.tray_index(128, 0) == 128
+    p = M.project_file_payload(subtask_name="j", remote_file="j.3mf", md5="x", trays=[128], style="orca")["print"]
+    assert p["ams_mapping"] == [128] and p["ams_mapping2"] == [{"ams_id": 128, "slot_id": 0}]
+
+
+def test_preflight_failed_state_rules():
+    ok = {"print": {"gcode_state": "FAILED", "print_error": 0, "hms": []}}
+    assert M.preflight(ok, [], None, None) == []
+    assert M.preflight({"print": {"gcode_state": "FAILED", "print_error": 5}}, [], None, None)
+    assert M.preflight({"print": {"gcode_state": "PAUSE", "print_error": 0}}, [], None, None)
+
+
+def test_summarize_exposes_hms_error_and_ams_units():
+    st = full_state()
+    st["print"]["print_error"] = 134184978
+    st["print"]["hms"] = [{"attr": 1, "code": 2}]
+    s = M.summarize("p1s", st)
+    assert s["print_error_hex"] == "0x7ff8012" and s["hms"] == [{"attr": 1, "code": 2}]
+    assert isinstance(s["ams_units"], list)
+
+
+def test_slice_flags():
+    from bambu_mcp.transfer import slice_flags
+    assert slice_flags(None) == []
+    assert slice_flags({"scale": 0.33, "rotate": 90}) == []                       # mesh pre-transform, not CLI
+    assert slice_flags({"orient": True, "arrange": True}) == ["--orient", "1", "--arrange", "1"]
+    assert slice_flags({"orient": False, "arrange": False}) == []
+    for bad in ({"scale": 0}, {"scale": 500}, {"nope": 1}, {"repetitions": 2}):
+        with pytest.raises(ValueError):
+            slice_flags(bad)
+
+
+def test_meshtool_scale_rotate_and_sit_on_bed(tmp_path):
+    from bambu_mcp import meshtool as T
+    box = [(x, y, z) for x in (0, 30) for y in (0, 30) for z in (0, 30)]
+    tris = [(0, 1, 3), (0, 3, 2), (4, 5, 7), (4, 7, 6)]
+    src = tmp_path / "box.stl"; T.write_stl(src, box, tris)
+    out = T.prepare_model(src, {"scale": 0.33}, tmp_path / "pre")
+    v, _ = T.load_mesh(out)
+    size = [max(p[i] for p in v) - min(p[i] for p in v) for i in range(3)]
+    assert [round(s, 2) for s in size] == [9.9, 9.9, 9.9] and min(p[2] for p in v) == 0
+    assert T.prepare_model(src, {"orient": True}, tmp_path / "pre2") == src        # no transform -> untouched
+    v2, _ = T.load_mesh(T.prepare_model(src, {"rotate_x": 90}, tmp_path / "pre3"))
+    assert round(max(p[2] for p in v2), 3) == 30.0 and round(min(p[2] for p in v2), 3) == 0.0

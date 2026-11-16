@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.parse
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
@@ -80,6 +81,47 @@ def ftps_upload(printer: Printer, path: Path, remote_name: str, cancel=None,
                            f"code={out.strip()[-3:]!r}): {scrub(err.strip())[:300]}")
 
 
+def _curl_ftps(printer: Printer, url: str, extra=(), timeout: float = 60) -> bytes:
+    cfg = f'user = "bblp:{printer.code}"\n'
+    r = subprocess.run([curl_bin(), "-sS", "--ssl-reqd", "-k", "--ftp-pasv", "--max-time", str(int(timeout)),
+                        "-K", "-", *extra, url], input=cfg.encode(), capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"FTPS failed (curl rc={r.returncode}): "
+                           f"{scrub(r.stderr.decode(errors='replace').strip())[:300]}")
+    return r.stdout
+
+
+def ftps_list(printer: Printer) -> list[str]:
+    """File names in the printer's FTPS root (the SD card)."""
+    out = _curl_ftps(printer, f"ftps://{printer.ip}:990/", ["--list-only"])
+    return [n.strip() for n in out.decode(errors="replace").splitlines() if n.strip()]
+
+
+def ftps_download(printer: Printer, remote_name: str, dest: Path, timeout: float = 300) -> Path:
+    data = _curl_ftps(printer, f"ftps://{printer.ip}:990/{urllib.parse.quote(remote_name)}", timeout=timeout)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return dest
+
+
+def slice_flags(xform: Optional[dict]) -> list[str]:
+    """Validate {scale, rotate, rotate_x, rotate_y, orient, arrange} and return the OrcaSlicer CLI flags.
+
+    Only orient/arrange are CLI flags: scale/rotate* are applied to the mesh beforehand (meshtool), because
+    this Orca build segfaults on --scale/--rotate*. (--arrange 0 and --repetitions also fail there.)"""
+    x = {k: v for k, v in (xform or {}).items() if v is not None}
+    unknown = set(x) - {"scale", "rotate", "rotate_x", "rotate_y", "orient", "arrange"}
+    if unknown:
+        raise ValueError(f"unknown slice option(s): {sorted(unknown)}")
+    if "scale" in x and not 0 < float(x["scale"]) <= 100:
+        raise ValueError("scale must be a factor in (0, 100], e.g. 0.33 for 33%")
+    flags: list[str] = []
+    for k in ("orient", "arrange"):
+        if x.get(k):
+            flags += [f"--{k}", "1"]
+    return flags
+
+
 def used_grams(text: str) -> Optional[list[float]]:
     m = re.search(r";\s*filament used \[g\]\s*=\s*([0-9.,\s]+)", text)
     if not m:
@@ -88,7 +130,8 @@ def used_grams(text: str) -> Optional[list[float]]:
 
 
 def slice_model(model: Path, profile_dir: Path, name: str, outdir: Path, cancel=None,
-                timeout: float = 1800, log: Optional[Callable[[str], None]] = None) -> dict:
+                timeout: float = 1800, log: Optional[Callable[[str], None]] = None,
+                xform: Optional[dict] = None) -> dict:
     """Run OrcaSlicer CLI with flattened profiles found in profile_dir."""
     for f in ("machine_flat.json", "process_flat.json", "filament_flat.json"):
         if not (profile_dir / f).is_file():
@@ -96,12 +139,15 @@ def slice_model(model: Path, profile_dir: Path, name: str, outdir: Path, cancel=
     if not model.is_file():
         raise FileNotFoundError(f"model not found: {model}")
     outdir.mkdir(parents=True, exist_ok=True)
+    flags = slice_flags(xform)                      # validates before any work
+    from .meshtool import prepare_model
+    model = prepare_model(model, xform, outdir / "pre")
     env = dict(os.environ)
     env.setdefault("XDG_RUNTIME_DIR", f"/tmp/xdg-{os.environ.get('USER', 'user')}")
     Path(env["XDG_RUNTIME_DIR"]).mkdir(mode=0o700, exist_ok=True)
     cmd = ["xvfb-run", "-a", str(Path(ORCA_BIN).expanduser()),
            "--load-settings", "machine_flat.json;process_flat.json",
-           "--load-filaments", "filament_flat.json", "--slice", "1",
+           "--load-filaments", "filament_flat.json", *flags, "--slice", "1",
            "--export-3mf", f"{name}.3mf", "--outputdir", str(outdir), str(model)]
     proc = subprocess.Popen(cmd, cwd=profile_dir, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)

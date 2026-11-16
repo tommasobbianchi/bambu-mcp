@@ -17,7 +17,8 @@ def wait_state(svc, job, st, t=10):
 
 
 def test_print_flow_upload_start_watch_finish(svc, threemf, env):
-    j = svc.submit_print("a1mini", str(threemf), [2], "PLA", "FFFFFFFF", 1, "mount_test", OPTS)
+    j = svc.submit_print("a1mini", str(threemf), [2], "PLA", "FFFFFFFF", 1, "mount_test",
+                        {**OPTS, "style": "legacy"})
     for _ in range(100):
         if svc.mgr.get(j.id)["phase"] == "watching":
             break
@@ -128,3 +129,16 @@ def test_failure_message_scrubbed(svc):
     j = svc.mgr.submit("x", None, {}, boom)
     r = wait_state(svc, j, "failed")
     assert CODE not in r["error"]
+
+
+def test_prepare_print_auto_style_follows_printer_model(svc, threemf):
+    _, _, _, payload, _ = svc.prepare_print("p1s", str(threemf), [2], None, None, 1, "auto_style", OPTS,
+                                            check_state=False)
+    assert payload["print"]["url"] == "ftp://auto_style.3mf" and payload["print"]["file"] == "auto_style.3mf"
+    svc.printers["p1s"].serial = "030FAKEA1MINI"        # A1 family keeps the legacy form
+    _, _, _, payload, _ = svc.prepare_print("p1s", str(threemf), [2], None, None, 1, "auto_style", OPTS,
+                                            check_state=False)
+    assert payload["print"]["url"] == "file:///sdcard/auto_style.3mf"
+    _, _, _, payload, _ = svc.prepare_print("p1s", str(threemf), [2], None, None, 1, "auto_style",
+                                            {**OPTS, "style": "orca"}, check_state=False)
+    assert payload["print"]["url"] == "ftp://auto_style.3mf"      # explicit style wins

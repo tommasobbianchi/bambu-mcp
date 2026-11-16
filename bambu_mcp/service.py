@@ -10,7 +10,7 @@ from . import mqtt as M
 from .config import Printer, env_dry_run, is_readonly, state_dir
 from .jobs import Job, JobManager
 from .mqtt import PrinterConn, PrinterError
-from .transfer import ftps_upload, inspect_3mf, safe_remote_name, slice_model
+from .transfer import ftps_download, ftps_list, ftps_upload, inspect_3mf, safe_remote_name, slice_model
 
 ACTIVE = ("RUNNING", "PREPARE", "PAUSE", "SLICING", "INIT")
 
@@ -55,13 +55,18 @@ class Service:
 
     # ------------------------------------------------------------------ print preparation
     def prepare_print(self, name: str, path: str, trays: list[int], expect_filament, expect_color,
-                      plate: int, job_name: Optional[str], opts: dict, check_state: bool = True):
+                      plate: int, job_name: Optional[str], opts: dict, check_state: bool = True,
+                      remote_name: Optional[str] = None):
         p = Path(path).expanduser()
         info = inspect_3mf(p, plate)
-        remote = safe_remote_name(job_name or p.stem)
+        remote = remote_name or safe_remote_name(job_name or p.stem)
+        opts = dict(opts)
+        style = opts.pop("style", "auto")
+        if style == "auto":
+            style = M.payload_style_for(self.printers[name].serial)
         payload = M.project_file_payload(
             subtask_name=remote[:-4], remote_file=remote, md5=info["md5"], plate=plate,
-            trays=trays, **opts)
+            trays=trays, style=style, **opts)
         problems: list[str] = []
         if check_state:
             try:
@@ -82,18 +87,21 @@ class Service:
 
     # ------------------------------------------------------------------ job bodies
     def _start_and_watch(self, job: Job, name, path, trays, expect_filament, expect_color,
-                         plate, job_name, opts, watch: bool):
+                         plate, job_name, opts, watch: bool, upload: bool = True,
+                         remote_name: Optional[str] = None):
         if is_readonly(name):
             raise PrinterError(f"{name} is marked read-only (BAMBU_MCP_READONLY); print refused")
         job.set(phase="preflight", message="checking file, printer state and AMS trays", snapshot=True)
         p, remote, info, payload, problems = self.prepare_print(
-            name, path, trays, expect_filament, expect_color, plate, job_name, opts)
+            name, path, trays, expect_filament, expect_color, plate, job_name, opts,
+            remote_name=remote_name)
         if problems:
             raise PrinterError("preflight refused: " + "; ".join(problems))
         job.check_cancel()
-        job.set(phase="uploading", message=f"uploading {remote} ({info['size']} bytes) via FTPS",
-                snapshot=True)
-        ftps_upload(self.printers[name], p, remote, cancel=job.cancel_event)
+        if upload:
+            job.set(phase="uploading", message=f"uploading {remote} ({info['size']} bytes) via FTPS",
+                    snapshot=True)
+            ftps_upload(self.printers[name], p, remote, cancel=job.cancel_event)
         job.check_cancel()
         c = self.conn(name)
         job.set(phase="starting", message="sending project_file", snapshot=True)
@@ -176,23 +184,55 @@ class Service:
     def submit_watch(self, name: str) -> Job:
         return self.mgr.submit("watch_print", name, {}, lambda j: self._watch(j, name))
 
-    def submit_slice(self, model, profile_dir, name_, printer=None) -> Job:
+    def sd_list(self, name: str) -> list[str]:
+        if name not in self.printers:
+            raise PrinterError(f"unknown printer {name!r}; known: {sorted(self.printers)}")
+        return ftps_list(self.printers[name])
+
+    def _fetch_sd(self, name: str, remote_file: str) -> Path:
+        files = self.sd_list(name)
+        if remote_file not in files:
+            raise PrinterError(f"{remote_file!r} is not on {name}'s SD card (see sd_list)")
+        dest = state_dir() / "sd" / name / safe_remote_name(remote_file)
+        return ftps_download(self.printers[name], remote_file, dest)
+
+    def print_sd_dry_run(self, name, remote_file, trays, expect_filament, expect_color, plate, opts):
+        local = self._fetch_sd(name, remote_file)
+        _, remote, info, payload, problems = self.prepare_print(
+            name, str(local), trays, expect_filament, expect_color, plate, None, opts, remote_name=remote_file)
+        return {"dry_run": True, "sent": False, "uploaded": False, "ok": not problems,
+                "problems": problems, "remote_file": remote, "md5": info["md5"],
+                "size": info["size"], "payload": payload}
+
+    def submit_print_sd(self, name, remote_file, trays, expect_filament, expect_color, plate, opts,
+                        watch=True) -> Job:
+        """Start a sliced .3mf that is already on the printer's SD card (no upload)."""
+        def body(job: Job):
+            job.set(phase="preflight", message=f"fetching {remote_file} from the SD card", snapshot=True)
+            local = self._fetch_sd(name, remote_file)
+            return self._start_and_watch(job, name, str(local), trays, expect_filament, expect_color,
+                                         plate, None, opts, watch, upload=False, remote_name=remote_file)
+        return self.mgr.submit("print_sd", name, {"file": remote_file, "trays": trays, "plate": plate,
+                                                  "watch": watch}, body)
+
+    def submit_slice(self, model, profile_dir, name_, printer=None, xform=None) -> Job:
         def body(job: Job):
             job.set(phase="slicing", message=f"slicing {Path(model).name}", snapshot=True)
             out = state_dir() / "slices" / job.id
             return slice_model(Path(model).expanduser(), Path(profile_dir).expanduser(), name_, out,
-                               cancel=job.cancel_event)
-        return self.mgr.submit("slice", printer, {"model": model, "profile_dir": profile_dir}, body)
+                               cancel=job.cancel_event, xform=xform)
+        return self.mgr.submit("slice", printer, {"model": model, "profile_dir": profile_dir,
+                                                  **({"xform": xform} if xform else {})}, body)
 
     def submit_slice_and_print(self, name, model, profile_dir, trays, expect_filament, expect_color,
-                               plate, job_name, opts, watch=True) -> Job:
+                               plate, job_name, opts, watch=True, xform=None) -> Job:
         base = job_name or Path(model).stem
 
         def body(job: Job):
             job.set(phase="slicing", message=f"slicing {Path(model).name}", snapshot=True)
             out = state_dir() / "slices" / job.id
             sl = slice_model(Path(model).expanduser(), Path(profile_dir).expanduser(), base, out,
-                             cancel=job.cancel_event)
+                             cancel=job.cancel_event, xform=xform)
             job.set(message=f"sliced, filament used g={sl['filament_used_g']}", snapshot=True)
             res = self._start_and_watch(job, name, sl["threemf"], trays, expect_filament,
                                         expect_color, plate, base, opts, watch)

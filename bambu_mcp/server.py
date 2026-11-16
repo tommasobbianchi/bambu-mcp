@@ -74,9 +74,20 @@ def _trays(tray: int | list[int]) -> list[int]:
     return t
 
 
-def _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali) -> dict:
-    return {"use_ams": use_ams, "timelapse": timelapse, "bed_leveling": bed_leveling,
-            "flow_cali": flow_cali, "vibration_cali": vibration_cali}
+def _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali, payload_style="auto",
+          bed_type=None, layer_inspect=None) -> dict:
+    o = {"use_ams": use_ams, "timelapse": timelapse, "bed_leveling": bed_leveling,
+         "flow_cali": flow_cali, "vibration_cali": vibration_cali, "style": payload_style}
+    if bed_type is not None:
+        o["bed_type"] = bed_type
+    if layer_inspect is not None:
+        o["layer_inspect"] = layer_inspect
+    return o
+
+
+def _xform(scale, rotate, rotate_x, rotate_y, orient, arrange) -> dict:
+    return {k: v for k, v in dict(scale=scale, rotate=rotate, rotate_x=rotate_x, rotate_y=rotate_y,
+                                  orient=orient, arrange=arrange).items() if v is not None}
 
 
 # ------------------------------------------------------------------ read-only
@@ -121,13 +132,15 @@ def print_3mf(printer: str, path: str, tray: int | list[int] = 0, expect_filamen
               expect_color: Optional[str] = None, plate: int = 1, name: Optional[str] = None,
               watch: bool = True, dry_run: Optional[bool] = None, use_ams: bool = True,
               timelapse: bool = False, bed_leveling: bool = True, flow_cali: bool = False,
-              vibration_cali: bool = False) -> dict:
+              vibration_cali: bool = False, payload_style: str = "auto",
+              bed_type: Optional[str] = None, layer_inspect: Optional[bool] = None) -> dict:
     """Upload a SLICED .3mf (must contain Metadata/plate_N.gcode) via FTPS and start it. Refuses unless
     the printer is IDLE/FINISH and each tray holds expect_filament (e.g. PLA) / expect_color (RRGGBBAA or
     RRGGBB). tray = AMS tray index (slot 3 -> 2). Returns a job_id immediately; with watch=true the job
     keeps following the print until FINISH/FAILED. dry_run=true: validates and returns the payload only
     (synchronous, nothing uploaded or published)."""
-    s, t, o = svc(), _trays(tray), _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali)
+    s, t, o = svc(), _trays(tray), _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali,
+                                         payload_style, bed_type, layer_inspect)
     from .config import env_dry_run
     if env_dry_run() if dry_run is None else dry_run:
         return s.print_dry_run(printer, path, t, expect_filament, expect_color, plate, name, o)
@@ -139,22 +152,61 @@ def slice_and_print(printer: str, model_path: str, profile_dir: str, tray: int |
                     expect_filament: Optional[str] = None, expect_color: Optional[str] = None,
                     plate: int = 1, name: Optional[str] = None, watch: bool = True,
                     use_ams: bool = True, timelapse: bool = False, bed_leveling: bool = True,
-                    flow_cali: bool = False, vibration_cali: bool = False) -> dict:
+                    flow_cali: bool = False, vibration_cali: bool = False,
+                    scale: Optional[float] = None, rotate: Optional[float] = None,
+                    rotate_x: Optional[float] = None, rotate_y: Optional[float] = None,
+                    orient: Optional[bool] = None, arrange: Optional[bool] = None,
+                    payload_style: str = "auto",
+                    bed_type: Optional[str] = None, layer_inspect: Optional[bool] = None) -> dict:
     """Background job: slice an STL/3MF with OrcaSlicer CLI (profile_dir must contain machine_flat.json,
     process_flat.json, filament_flat.json), then run the print_3mf flow and watch to the end. Returns a
-    job_id. To preview without printing use slice_model. (No dry-run: use slice_model + print_3mf dry_run.)"""
+    job_id. To preview without printing use slice_model. (No dry-run: use slice_model + print_3mf dry_run.)
+    Model transforms: scale is a factor (0.33 = 33%), rotate (Z)/rotate_x/rotate_y in degrees (applied to
+    the mesh before slicing; .stl or .3mf input), orient/arrange = true to let Orca auto-orient/arrange."""
     from .config import env_dry_run
     if env_dry_run():
         raise PrinterError("BAMBU_MCP_DRY_RUN=1: slice_and_print refused; use slice_model then print_3mf dry_run")
     return svc().submit_slice_and_print(
         printer, model_path, profile_dir, _trays(tray), expect_filament, expect_color, plate, name,
-        _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali), watch).summary()
+        _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali, payload_style, bed_type,
+              layer_inspect), watch,
+        _xform(scale, rotate, rotate_x, rotate_y, orient, arrange)).summary()
 
 
 @tool
-def slice_model(model_path: str, profile_dir: str, name: str) -> dict:
-    """Background job: slice only (no printer contact). Result has threemf path and filament_used_g."""
-    return svc().submit_slice(model_path, profile_dir, name).summary()
+def slice_model(model_path: str, profile_dir: str, name: str, scale: Optional[float] = None,
+                rotate: Optional[float] = None, rotate_x: Optional[float] = None,
+                rotate_y: Optional[float] = None, orient: Optional[bool] = None,
+                arrange: Optional[bool] = None) -> dict:
+    """Background job: slice only (no printer contact). Result has threemf path and filament_used_g.
+    Model transforms: scale factor (0.33 = 33%), rotate (Z)/rotate_x/rotate_y degrees (applied to the mesh
+    before slicing; .stl or .3mf input), orient/arrange = true to let Orca auto-orient/arrange."""
+    return svc().submit_slice(model_path, profile_dir, name, None,
+                              _xform(scale, rotate, rotate_x, rotate_y, orient, arrange)).summary()
+
+
+@tool
+def sd_list(printer: str) -> dict:
+    """Read-only: names of the files on the printer's SD card (FTPS root)."""
+    return {"printer": printer, "files": svc().sd_list(printer)}
+
+
+@tool
+def print_sd_file(printer: str, remote_file: str, tray: int | list[int] = 0,
+                  expect_filament: Optional[str] = None, expect_color: Optional[str] = None,
+                  plate: int = 1, watch: bool = True, dry_run: Optional[bool] = None,
+                  use_ams: bool = True, timelapse: bool = False, bed_leveling: bool = True,
+                  flow_cali: bool = False, vibration_cali: bool = False, payload_style: str = "auto",
+                  bed_type: Optional[str] = None, layer_inspect: Optional[bool] = None) -> dict:
+    """Start a SLICED .gcode.3mf that is ALREADY on the printer's SD card (see sd_list); nothing is
+    uploaded. Same safety checks as print_3mf (printer IDLE/FINISH, tray holds expect_filament/colour).
+    dry_run=true validates and returns the payload only."""
+    s, t = svc(), _trays(tray)
+    o = _opts(use_ams, timelapse, bed_leveling, flow_cali, vibration_cali, payload_style, bed_type, layer_inspect)
+    from .config import env_dry_run
+    if env_dry_run() if dry_run is None else dry_run:
+        return s.print_sd_dry_run(printer, remote_file, t, expect_filament, expect_color, plate, o)
+    return s.submit_print_sd(printer, remote_file, t, expect_filament, expect_color, plate, o, watch).summary()
 
 
 @tool

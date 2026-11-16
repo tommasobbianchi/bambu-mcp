@@ -9,6 +9,7 @@ import copy
 import itertools
 import json
 import os
+import re
 import ssl
 import threading
 import time
@@ -37,11 +38,35 @@ def tray_ams_slot(tray: int) -> tuple[int, int]:
     return (tray, 0) if tray >= 128 else (tray // 4, tray % 4)
 
 
+def payload_style_for(serial: str) -> str:
+    """'legacy' (file:///sdcard/..) for A1 / A1 mini (serials 030..., 039...), 'orca' (the OrcaSlicer/
+    Bambu Studio form, ftp://<file> plus the extra cali fields) for P1/X1 firmware, which on a P1S with
+    firmware 01.10 answers the legacy form with HMS 0500-4003 ("unable to parse the file")."""
+    return "legacy" if (serial or "")[:3] in ("030", "039") else "orca"
+
+
 def project_file_payload(*, subtask_name: str, remote_file: str, md5: str, plate: int = 1,
                          trays: list[int], use_ams: bool = True, timelapse: bool = False,
                          bed_leveling: bool = True, flow_cali: bool = False,
-                         vibration_cali: bool = False, layer_inspect: bool = False,
-                         bed_type: str = "auto") -> dict:
+                         vibration_cali: bool = False, layer_inspect: Optional[bool] = None,
+                         bed_type: Optional[str] = None, style: str = "legacy") -> dict:
+    if style == "orca":
+        return {"print": {
+            "sequence_id": next_seq(), "command": "project_file",
+            "param": f"Metadata/plate_{plate}.gcode",
+            "subtask_name": re.sub(r"(\.gcode)?\.3mf$", "", remote_file, flags=re.I),
+            "url": f"ftp://{remote_file}", "file": remote_file, "md5": md5,
+            "timelapse": timelapse, "bed_type": bed_type or "textured_plate",
+            "bed_leveling": bed_leveling, "auto_bed_leveling": 1 if bed_leveling else 0,
+            "flow_cali": flow_cali, "extrude_cali_flag": 1 if flow_cali else 2,
+            "nozzle_offset_cali": 2, "cfg": "0", "vibration_cali": vibration_cali,
+            "layer_inspect": True if layer_inspect is None else layer_inspect,
+            "use_ams": use_ams,
+            "ams_mapping": list(trays),
+            "ams_mapping2": [{"ams_id": tray_ams_slot(t)[0], "slot_id": tray_ams_slot(t)[1]} for t in trays],
+            "profile_id": "0", "project_id": "0", "subtask_id": "0", "task_id": "0"}}
+    layer_inspect = bool(layer_inspect)
+    bed_type = bed_type or "auto"
     return {"print": {
         "sequence_id": next_seq(), "command": "project_file",
         "param": f"Metadata/plate_{plate}.gcode",
@@ -120,6 +145,11 @@ def summarize(name: str, state: dict, age_s: Optional[float] = None) -> dict:
         "nozzle_c": p.get("nozzle_temper"), "nozzle_target_c": p.get("nozzle_target_temper"),
         "bed_c": p.get("bed_temper"), "bed_target_c": p.get("bed_target_temper"),
         "print_error": p.get("print_error"), "stage": p.get("stg_cur"),
+        "print_error_hex": hex(p["print_error"]) if isinstance(p.get("print_error"), int) and p["print_error"] else None,
+        "hms": p.get("hms") or [], "ams_status": p.get("ams_status"),
+        "ams_units": [{"id": int(u.get("id", 0)), "humidity": u.get("humidity"), "temp": u.get("temp"),
+                       "trays": len(u.get("tray", []) or [])}
+                      for u in (p.get("ams", {}) or {}).get("ams", []) or []],
         "ams_trays": trays_of(state),
         "report_age_s": None if age_s is None else round(age_s, 1),
     }
